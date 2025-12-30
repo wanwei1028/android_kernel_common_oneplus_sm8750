@@ -14,8 +14,25 @@
 #define HMBIRD_OPS_IDX 14
 #define HMBIRD_RQ_IDX 15
 
+/*
+ * Safe accessor for hmbird_entity with NULL checking.
+ *
+ * Returns NULL if:
+ * - @p is NULL
+ * - @p->android_oem_data1[HMBIRD_TS_IDX] is NULL (not allocated)
+ *
+ * IMPORTANT: Callers MUST check the return value before dereferencing!
+ *
+ * Example:
+ *   struct hmbird_entity *entity = get_hmbird_ts(p);
+ *   if (!entity)
+ *       return;
+ *   entity->flags = ...;
+ */
 #define get_hmbird_ts(p)	\
-	((struct hmbird_entity *)(p->android_oem_data1[HMBIRD_TS_IDX]))
+	((struct hmbird_entity *)( \
+		(p) ? (p)->android_oem_data1[HMBIRD_TS_IDX] : 0 \
+	))
 
 #define get_hmbird_rq(rq)	\
 	((struct hmbird_rq *)(rq->android_oem_data1[HMBIRD_RQ_IDX]))

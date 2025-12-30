@@ -37,10 +37,22 @@ enum hmbird_ops_enable_state {
 	HMBIRD_OPS_DISABLED,
 };
 
+/*
+ * Atomically free hmbird_entity to prevent double-free.
+ * Uses xchg to atomically swap the pointer with NULL.
+ */
 static inline void put_hmbird_ts(struct task_struct *p)
 {
-	kfree((void *)p->android_oem_data1[HMBIRD_TS_IDX]);
-	p->android_oem_data1[HMBIRD_TS_IDX] = 0;
+	void *ptr;
+
+	if (!p)
+		return;
+
+	/* Atomically get and clear the pointer */
+	ptr = (void *)xchg(&p->android_oem_data1[HMBIRD_TS_IDX], 0);
+
+	/* Free if it was non-NULL */
+	kfree(ptr);
 }
 
 static inline struct task_group *css_tg(struct cgroup_subsys_state *css)
@@ -776,19 +788,24 @@ static struct hmbird_dispatch_q *find_dsq_from_task(struct task_struct *p)
 	int idx;
 	unsigned long flags;
 	struct hmbird_dispatch_q *dsq;
+	struct hmbird_entity *entity;
 
 	if (!p)
+		return NULL;
+
+	entity = get_hmbird_ts(p);
+	if (!entity)
 		return NULL;
 
 	idx = find_idx_from_task(p);
 	if (is_pcp_idx(idx)) {
 		idx -= MAX_GLOBAL_DSQS;
 		dsq = &per_cpu(pcp_ldsq, idx);
-		get_hmbird_ts(p)->gdsq_idx = dsq_id_to_internal(dsq);
+		entity->gdsq_idx = dsq_id_to_internal(dsq);
 		slim_stats_record(PCP_LDSQ_CNT, 0, 0, idx);
 	} else {
 		dsq = &gdsqs[idx];
-		get_hmbird_ts(p)->gdsq_idx = idx;
+		entity->gdsq_idx = idx;
 		slim_stats_record(GDSQ_CNT, 0, idx, 0);
 	}
 
@@ -1562,9 +1579,9 @@ static void init_dsq_at_boot(void)
 	}
 	for_each_possible_cpu(cpu)
 		init_dsq(&per_cpu(pcp_ldsq, cpu), (u64)HMBIRD_DSQ_FLAG_BUILTIN |
-				(GDSQS_ID_BASE + i + cpu));
+				(GDSQS_ID_BASE + MAX_GLOBAL_DSQS + cpu));
 
-	max_hmbird_dsq_internal_id = GDSQS_ID_BASE + i + cpu;
+	max_hmbird_dsq_internal_id = GDSQS_ID_BASE + MAX_GLOBAL_DSQS + num_possible_cpus();
 	spin_lock_init(&sinfo.lock);
 }
 
@@ -1841,8 +1858,11 @@ static void update_curr_hmbird(struct rq *rq)
 	account_group_exec_runtime(curr, delta_exec);
 	cgroup_account_cputime(curr, delta_exec);
 
-	if (get_hmbird_ts(curr)->slice != HMBIRD_SLICE_INF)
-		get_hmbird_ts(curr)->slice -= min(get_hmbird_ts(curr)->slice, delta_exec);
+	{
+		struct hmbird_entity *curr_entity = get_hmbird_ts(curr);
+		if (curr_entity && curr_entity->slice != HMBIRD_SLICE_INF)
+			curr_entity->slice -= min(curr_entity->slice, delta_exec);
+	}
 
 	trace_sched_stat_runtime(curr, delta_exec, 0);
 }
@@ -1863,13 +1883,20 @@ static void dispatch_enqueue(struct hmbird_dispatch_q *dsq, struct task_struct *
 {
 	bool is_local = dsq->id == HMBIRD_DSQ_LOCAL;
 	unsigned long flags;
+	struct hmbird_entity *entity = get_hmbird_ts(p);
 
-	hmbird_cond_deferred_err(ENQ_EXIST1, get_hmbird_ts(p)->dsq ||
-				!list_empty(&get_hmbird_ts(p)->dsq_node.fifo),
+	if (!entity) {
+		WRITE_ONCE(sw_type, HMBIRD_SWITCH_ERR_DSQ);
+		hmbird_ops_error("<hmbird_sched>: task %s has no hmbird_entity\n", p->comm);
+		return;
+	}
+
+	hmbird_cond_deferred_err(ENQ_EXIST1, entity->dsq ||
+				!list_empty(&entity->dsq_node.fifo),
 				"task = %s, dsq->id = %llu\n", p->comm, dsq->id);
 	hmbird_cond_deferred_err(ENQ_EXIST2,
-				(get_hmbird_ts(p)->dsq_flags & HMBIRD_TASK_DSQ_ON_PRIQ) ||
-				!RB_EMPTY_NODE(&get_hmbird_ts(p)->dsq_node.priq),
+				(entity->dsq_flags & HMBIRD_TASK_DSQ_ON_PRIQ) ||
+				!RB_EMPTY_NODE(&entity->dsq_node.priq),
 				"task = %s\n", p->comm);
 
 	if (!is_local) {
@@ -1886,24 +1913,24 @@ static void dispatch_enqueue(struct hmbird_dispatch_q *dsq, struct task_struct *
 	}
 
 	if (enq_flags & HMBIRD_ENQ_DSQ_PRIQ) {
-		get_hmbird_ts(p)->dsq_flags |= HMBIRD_TASK_DSQ_ON_PRIQ;
-		rb_add_cached(&get_hmbird_ts(p)->dsq_node.priq, &dsq->priq,
+		entity->dsq_flags |= HMBIRD_TASK_DSQ_ON_PRIQ;
+		rb_add_cached(&entity->dsq_node.priq, &dsq->priq,
 					hmbird_dsq_priq_less);
 	} else {
 		if (enq_flags & (HMBIRD_ENQ_HEAD | HMBIRD_ENQ_PREEMPT))
-			list_add(&get_hmbird_ts(p)->dsq_node.fifo, &dsq->fifo);
+			list_add(&entity->dsq_node.fifo, &dsq->fifo);
 		else
-			list_add_tail(&get_hmbird_ts(p)->dsq_node.fifo, &dsq->fifo);
+			list_add_tail(&entity->dsq_node.fifo, &dsq->fifo);
 	}
 	dsq->nr++;
-	get_hmbird_ts(p)->dsq = dsq;
+	entity->dsq = dsq;
 
 	/*
 	 * We're transitioning out of QUEUEING or DISPATCHING. store_release to
 	 * match waiters' load_acquire.
 	 */
 	if (enq_flags & HMBIRD_ENQ_CLEAR_OPSS)
-		atomic64_set_release(&get_hmbird_ts(p)->ops_state, HMBIRD_OPSS_NONE);
+		atomic64_set_release(&entity->ops_state, HMBIRD_OPSS_NONE);
 
 	if (is_local) {
 		struct hmbird_rq *hmbird = container_of(dsq, struct hmbird_rq, local_dsq);
@@ -1912,7 +1939,9 @@ static void dispatch_enqueue(struct hmbird_dispatch_q *dsq, struct task_struct *
 
 		if ((enq_flags & HMBIRD_ENQ_PREEMPT) && p != rq->curr &&
 			rq->curr->sched_class == &hmbird_sched_class) {
-			get_hmbird_ts(rq->curr)->slice = 0;
+			struct hmbird_entity *curr_entity = get_hmbird_ts(rq->curr);
+			if (curr_entity)
+				curr_entity->slice = 0;
 			preempt = true;
 		}
 
@@ -1927,26 +1956,43 @@ static void dispatch_enqueue(struct hmbird_dispatch_q *dsq, struct task_struct *
 static void task_unlink_from_dsq(struct task_struct *p,
 				struct hmbird_dispatch_q *dsq)
 {
-	if (get_hmbird_ts(p)->dsq_flags & HMBIRD_TASK_DSQ_ON_PRIQ) {
-		rb_erase_cached(&get_hmbird_ts(p)->dsq_node.priq, &dsq->priq);
-		RB_CLEAR_NODE(&get_hmbird_ts(p)->dsq_node.priq);
-		get_hmbird_ts(p)->dsq_flags &= ~HMBIRD_TASK_DSQ_ON_PRIQ;
+	struct hmbird_entity *entity = get_hmbird_ts(p);
+
+	if (!entity)
+		return;
+
+	if (entity->dsq_flags & HMBIRD_TASK_DSQ_ON_PRIQ) {
+		rb_erase_cached(&entity->dsq_node.priq, &dsq->priq);
+		RB_CLEAR_NODE(&entity->dsq_node.priq);
+		entity->dsq_flags &= ~HMBIRD_TASK_DSQ_ON_PRIQ;
 	} else {
-		list_del_init(&get_hmbird_ts(p)->dsq_node.fifo);
+		list_del_init(&entity->dsq_node.fifo);
 	}
 }
 
 static bool task_linked_on_dsq(struct task_struct *p)
 {
-	return !list_empty(&get_hmbird_ts(p)->dsq_node.fifo) ||
-		!RB_EMPTY_NODE(&get_hmbird_ts(p)->dsq_node.priq);
+	struct hmbird_entity *entity = get_hmbird_ts(p);
+
+	if (!entity)
+		return false;
+
+	return !list_empty(&entity->dsq_node.fifo) ||
+		!RB_EMPTY_NODE(&entity->dsq_node.priq);
 }
 
 static void dispatch_dequeue(struct hmbird_rq *hmbird_rq, struct task_struct *p)
 {
 	unsigned long flags;
-	struct hmbird_dispatch_q *dsq = get_hmbird_ts(p)->dsq;
-	bool is_local = dsq == &hmbird_rq->local_dsq;
+	struct hmbird_entity *entity = get_hmbird_ts(p);
+	struct hmbird_dispatch_q *dsq;
+	bool is_local;
+
+	if (!entity)
+		return;
+
+	dsq = entity->dsq;
+	is_local = dsq == &hmbird_rq->local_dsq;
 
 	if (!dsq) {
 		hmbird_cond_deferred_err(TASK_LINKED1,
@@ -1954,11 +2000,11 @@ static void dispatch_dequeue(struct hmbird_rq *hmbird_rq, struct task_struct *p)
 		/*
 		 * When dispatching directly from the BPF scheduler to a local
 		 * DSQ, the task isn't associated with any DSQ but
-		 * @get_hmbird_ts(p)->holding_cpu may be set under the protection of
+		 * @entity->holding_cpu may be set under the protection of
 		 * %HMBIRD_OPSS_DISPATCHING.
 		 */
-		if (get_hmbird_ts(p)->holding_cpu >= 0)
-			get_hmbird_ts(p)->holding_cpu = -1;
+		if (entity->holding_cpu >= 0)
+			entity->holding_cpu = -1;
 		return;
 	}
 
@@ -1966,10 +2012,10 @@ static void dispatch_dequeue(struct hmbird_rq *hmbird_rq, struct task_struct *p)
 		raw_spin_lock_irqsave(&dsq->lock, flags);
 
 	/*
-	 * Now that we hold @dsq->lock, @p->holding_cpu and @get_hmbird_ts(p)->dsq_node
+	 * Now that we hold @dsq->lock, @p->holding_cpu and @entity->dsq_node
 	 * can't change underneath us.
 	 */
-	if (get_hmbird_ts(p)->holding_cpu < 0) {
+	if (entity->holding_cpu < 0) {
 		/* @p must still be on @dsq, dequeue */
 		hmbird_cond_deferred_err(TASK_UNLINKED,
 						!task_linked_on_dsq(p), "task = %s\n", p->comm);
@@ -1978,15 +2024,15 @@ static void dispatch_dequeue(struct hmbird_rq *hmbird_rq, struct task_struct *p)
 	} else {
 		/*
 		 * We're racing against dispatch_to_local_dsq() which already
-		 * removed @p from @dsq and set @get_hmbird_ts(p)->holding_cpu. Clear the
+		 * removed @p from @dsq and set @entity->holding_cpu. Clear the
 		 * holding_cpu which tells dispatch_to_local_dsq() that it lost
 		 * the race.
 		 */
 		hmbird_cond_deferred_err(TASK_LINKED2,
 						task_linked_on_dsq(p), "task = %s\n", p->comm);
-		get_hmbird_ts(p)->holding_cpu = -1;
+		entity->holding_cpu = -1;
 	}
-	get_hmbird_ts(p)->dsq = NULL;
+	entity->dsq = NULL;
 
 	if (!is_local)
 		raw_spin_unlock_irqrestore(&dsq->lock, flags);
@@ -2004,22 +2050,32 @@ static bool test_rq_online(struct rq *rq)
 
 static void refill_task_slice(struct task_struct *p)
 {
+	struct hmbird_entity *entity = get_hmbird_ts(p);
+
+	if (!entity)
+		return;
+
 	if (is_isolate_task(p))
-		get_hmbird_ts(p)->slice = HMBIRD_SLICE_ISO;
+		entity->slice = HMBIRD_SLICE_ISO;
 	else if (is_pipeline_task(p))
-		get_hmbird_ts(p)->slice = HMBIRD_SLICE_ISO / 2;
+		entity->slice = HMBIRD_SLICE_ISO / 2;
 	else
-		get_hmbird_ts(p)->slice = HMBIRD_SLICE_DFL;
+		entity->slice = HMBIRD_SLICE_DFL;
 }
 
 static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
 				int sticky_cpu)
 {
+	struct hmbird_entity *entity;
 	struct hmbird_dispatch_q *d;
 	s32 cpu = -1;
 
+	entity = get_hmbird_ts(p);
+	if (WARN_ON_ONCE(!entity))
+		return;
+
 	hmbird_cond_deferred_err(TASK_UNQUED, !test_bit(ffs(HMBIRD_TASK_QUEUED),
-				(unsigned long *)&get_hmbird_ts(p)->flags),
+				(unsigned long *)&entity->flags),
 				"task = %s\n", p->comm);
 
 	if (is_pcp_rt(p)) {
@@ -2029,14 +2085,14 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
 			enq_flags |= HMBIRD_ENQ_LOCAL;
 	}
 
-	cpu = get_hmbird_ts(p)->critical_affinity_cpu;
+	cpu = entity->critical_affinity_cpu;
 	if (cpu >= 0) {
-		set_bit(ffs(HMBIRD_TASK_ENQ_LOCAL), (unsigned long *)&get_hmbird_ts(p)->flags);
+		set_bit(ffs(HMBIRD_TASK_ENQ_LOCAL), (unsigned long *)&entity->flags);
 	}
 
-	if (test_bit(ffs(HMBIRD_TASK_ENQ_LOCAL), (unsigned long *)&get_hmbird_ts(p)->flags)) {
+	if (test_bit(ffs(HMBIRD_TASK_ENQ_LOCAL), (unsigned long *)&entity->flags)) {
 		enq_flags |= HMBIRD_ENQ_LOCAL;
-		clear_bit(ffs(HMBIRD_TASK_ENQ_LOCAL), (unsigned long *)&get_hmbird_ts(p)->flags);
+		clear_bit(ffs(HMBIRD_TASK_ENQ_LOCAL), (unsigned long *)&entity->flags);
 	}
 	/* rq migration */
 	if (sticky_cpu == cpu_of(rq))
@@ -2083,33 +2139,50 @@ global:
 
 static bool watchdog_task_watched(const struct task_struct *p)
 {
-	return !list_empty(&get_hmbird_ts(p)->watchdog_node);
+	struct hmbird_entity *entity = get_hmbird_ts(p);
+	return entity && !list_empty(&entity->watchdog_node);
 }
 
 static void watchdog_watch_task(struct rq *rq, struct task_struct *p)
 {
+	struct hmbird_entity *entity = get_hmbird_ts(p);
+
 	lockdep_assert_rq_held(rq);
-	if (test_bit(ffs(HMBIRD_TASK_WATCHDOG_RESET), (unsigned long *)&get_hmbird_ts(p)->flags))
-		get_hmbird_ts(p)->runnable_at = jiffies;
-	clear_bit(ffs(HMBIRD_TASK_WATCHDOG_RESET), (unsigned long *)&get_hmbird_ts(p)->flags);
-	list_add_tail(&get_hmbird_ts(p)->watchdog_node, &get_hmbird_rq(rq)->watchdog_list);
+	if (WARN_ON_ONCE(!entity))
+		return;
+
+	if (test_bit(ffs(HMBIRD_TASK_WATCHDOG_RESET), (unsigned long *)&entity->flags))
+		entity->runnable_at = jiffies;
+	clear_bit(ffs(HMBIRD_TASK_WATCHDOG_RESET), (unsigned long *)&entity->flags);
+	list_add_tail(&entity->watchdog_node, &get_hmbird_rq(rq)->watchdog_list);
 }
 
 static void watchdog_unwatch_task(struct task_struct *p, bool reset_timeout)
 {
-	list_del_init(&get_hmbird_ts(p)->watchdog_node);
+	struct hmbird_entity *entity = get_hmbird_ts(p);
+
+	if (WARN_ON_ONCE(!entity))
+		return;
+
+	list_del_init(&entity->watchdog_node);
 	if (reset_timeout)
-		set_bit(ffs(HMBIRD_TASK_WATCHDOG_RESET), (unsigned long *)&get_hmbird_ts(p)->flags);
+		set_bit(ffs(HMBIRD_TASK_WATCHDOG_RESET), (unsigned long *)&entity->flags);
 }
 
 static void enqueue_task_hmbird(struct rq *rq, struct task_struct *p, int enq_flags)
 {
-	int sticky_cpu = get_hmbird_ts(p)->sticky_cpu;
+	struct hmbird_entity *entity = get_hmbird_ts(p);
+	int sticky_cpu;
+
+	if (WARN_ON_ONCE(!entity))
+		return;
+
+	sticky_cpu = entity->sticky_cpu;
 
 	enq_flags |= get_hmbird_rq(rq)->extra_enq_flags;
 
 	if (sticky_cpu >= 0)
-		get_hmbird_ts(p)->sticky_cpu = -1;
+		entity->sticky_cpu = -1;
 
 	/*
 	 * Restoring a running task will be immediately followed by
@@ -2120,14 +2193,14 @@ static void enqueue_task_hmbird(struct rq *rq, struct task_struct *p, int enq_fl
 	if (unlikely(enq_flags & ENQUEUE_RESTORE) && task_current(rq, p))
 		sticky_cpu = cpu_of(rq);
 
-	if (test_bit(ffs(HMBIRD_TASK_QUEUED), (unsigned long *)&get_hmbird_ts(p)->flags)) {
+	if (test_bit(ffs(HMBIRD_TASK_QUEUED), (unsigned long *)&entity->flags)) {
 		hmbird_cond_deferred_err(TASK_UNWATCHED,
 			!watchdog_task_watched(p), "task = %s\n", p->comm);
 		return;
 	}
 
 	watchdog_watch_task(rq, p);
-	set_bit(ffs(HMBIRD_TASK_QUEUED), (unsigned long *)&get_hmbird_ts(p)->flags);
+	set_bit(ffs(HMBIRD_TASK_QUEUED), (unsigned long *)&entity->flags);
 	get_hmbird_rq(rq)->nr_running++;
 	add_nr_running(rq, 1);
 
@@ -2404,60 +2477,94 @@ bool consume_dispatch_q(struct rq *rq, struct rq_flags *rf,
 {
 	struct hmbird_rq *hmbird_rq = get_hmbird_rq(rq);
 	struct hmbird_entity *entity;
-	struct task_struct *p;
+	struct task_struct *p = NULL;
 	struct rb_node *rb_node;
 	struct rq *task_rq;
 	unsigned long flags;
 	bool moved = false;
 	struct task_struct *may_fit = NULL;
 	int skip = 0;
+	int this_cpu;
 
+	/*
+	 * Consume tasks from @dsq to @rq. This function implements a careful
+	 * protocol to avoid deadlocks and race conditions when moving tasks
+	 * between runqueues.
+	 *
+	 * Lock ordering requirements:
+	 * 1. dsq->lock protects the dispatch queue
+	 * 2. rq->lock protects the runqueue
+	 * 3. Never hold dsq->lock while calling task_rq() and then locking that rq
+	 *
+	 * The protocol works as follows:
+	 * 1. Hold dsq->lock and select a task
+	 * 2. Set holding_cpu to claim exclusive ownership
+	 * 3. Release dsq->lock
+	 * 4. Lock both rq's (current and task's)
+	 * 5. Verify we still own the task (holding_cpu check)
+	 * 6. Move the task
+	 */
 retry:
 	if (list_empty(&dsq->fifo) && !rb_first_cached(&dsq->priq))
 		return false;
 
 	raw_spin_lock_irqsave(&dsq->lock, flags);
 
+	/* Search FIFO queue for suitable task */
 	list_for_each_entry(entity, &dsq->fifo, dsq_node.fifo) {
+		struct rq *candidate_rq;
+
 		p = entity->task;
-		task_rq = task_rq(p);
+		candidate_rq = task_rq(p);
+
 		if (!task_can_run_on_rq(p, rq, dsq))
 			continue;
-		if (rq == task_rq) {
+
+		if (rq == candidate_rq) {
+			/* Task is on this rq, easy path */
 			set_skip_num(dsq, skip_num, (bool)may_fit);
 			goto this_rq;
 		}
+
 		if (skip_too_much(dsq))
-			goto remote_rq;
+			goto found_remote;
+
 		if (!may_fit)
 			may_fit = p;
+
 		if (++skip <= 3)
 			continue;
+
 		/*
-		 * If the recent 3 tasks not fit, use the first one.
+		 * If the recent 3 tasks don't fit, use the first one
 		 * and clear the skip, because the first one is consumed.
 		 */
 		set_skip_num(dsq, skip_num, false);
 		p = may_fit;
-		task_rq = task_rq(p);
-		goto remote_rq;
-	}
-	/* No more task, use the first may fit task.*/
-	if (may_fit) {
-		p = may_fit;
-		task_rq = task_rq(p);
-		goto remote_rq;
+		goto found_remote;
 	}
 
+	/* No more task in FIFO, use the first may_fit task */
+	if (may_fit) {
+		p = may_fit;
+		goto found_remote;
+	}
+
+	/* Search priority queue */
 	for (rb_node = rb_first_cached(&dsq->priq); rb_node; rb_node = rb_next(rb_node)) {
+		struct rq *candidate_rq;
+
 		entity = container_of(rb_node, struct hmbird_entity, dsq_node.priq);
 		p = entity->task;
-		task_rq = task_rq(p);
+		candidate_rq = task_rq(p);
+
 		if (!task_can_run_on_rq(p, rq, dsq))
 			continue;
-		if (rq == task_rq)
+
+		if (rq == candidate_rq)
 			goto this_rq;
-		goto remote_rq;
+
+		goto found_remote;
 	}
 
 	raw_spin_unlock_irqrestore(&dsq->lock, flags);
@@ -2467,48 +2574,102 @@ this_rq:
 	/* @dsq is locked and @p is on this rq */
 	hmbird_cond_deferred_err(HOLDING_CPU1, get_hmbird_ts(p)->holding_cpu >= 0,
 					"task = %s\n", p->comm);
+
 	task_unlink_from_dsq(p, dsq);
 	list_add_tail(&get_hmbird_ts(p)->dsq_node.fifo, &hmbird_rq->local_dsq.fifo);
 	dsq->nr--;
 	hmbird_rq->local_dsq.nr++;
 	get_hmbird_ts(p)->dsq = &hmbird_rq->local_dsq;
+
 	raw_spin_unlock_irqrestore(&dsq->lock, flags);
 	slim_stats_record(TOTAL_DSP_CNT, 0, 0, 0);
 	return true;
 
-remote_rq:
+found_remote:
 #ifdef CONFIG_SMP
+	/*
+	 * @dsq is locked and @p is on a remote rq. @p is currently protected by
+	 * @dsq->lock. We want to pull @p to @rq but must follow the protocol to
+	 * avoid deadlocks with concurrent dequeue operations.
+	 *
+	 * The protocol:
+	 * 1. While holding dsq->lock, set holding_cpu to claim ownership
+	 * 2. Release dsq->lock
+	 * 3. Lock both rq's using double_lock_balance()
+	 * 4. Call move_task_to_local_dsq() which verifies holding_cpu
+	 *
+	 * See move_task_to_local_dsq() for details on how this prevents races.
+	 */
+	this_cpu = raw_smp_processor_id();
+
 	if (cpu_same_cluster_stat(p, rq, task_rq))
 		slim_stats_record(MOVE_RQ_CNT, 0, 0, 0);
 	else
 		slim_stats_record(MOVE_RQ_CNT, 1, 0, 0);
-	/*
-	 * @dsq is locked and @p is on a remote rq. @p is currently protected by
-	 * @dsq->lock. We want to pull @p to @rq but may deadlock if we grab
-	 * @task_rq while holding @dsq and @rq locks. As dequeue can't drop the
-	 * rq lock or fail, do a little dancing from our side. See
-	 * move_task_to_local_dsq().
-	 */
+
 	hmbird_cond_deferred_err(HOLDING_CPU2, get_hmbird_ts(p)->holding_cpu >= 0,
 					"task = %s\n", p->comm);
+
+	/*
+	 * Claim exclusive ownership of @p by setting holding_cpu.
+	 * This tells concurrent dequeue operations that we're handling
+	 * this task's migration.
+	 */
 	task_unlink_from_dsq(p, dsq);
 	dsq->nr--;
-	get_hmbird_ts(p)->holding_cpu = raw_smp_processor_id();
+	get_hmbird_ts(p)->holding_cpu = this_cpu;
+
+	/*
+	 * CRITICAL: Release dsq->lock before attempting to lock rq's.
+	 *
+	 * We've set holding_cpu to claim ownership. Now we must release
+	 * dsq->lock before locking the rq's to maintain proper lock ordering
+	 * and avoid deadlocks.
+	 *
+	 * After releasing dsq->lock:
+	 * - Another CPU might modify p->rq through migration
+	 * - But holding_cpu prevents them from dequeuing
+	 * - We'll re-read task_rq() after locking both rq's
+	 */
 	raw_spin_unlock_irqrestore(&dsq->lock, flags);
 
+	/*
+	 * Lock both runqueues.
+	 *
+	 * IMPORTANT: task_rq we stored earlier might be stale now!
+	 * We MUST re-read task_rq() after acquiring the locks.
+	 * The double_lock_balance() handles the lock ordering.
+	 */
 	rq_unpin_lock(rq, rf);
 	double_lock_balance(rq, task_rq);
 	rq_repin_lock(rq, rf);
 
+	/*
+	 * Verify we still own the task before moving it.
+	 *
+	 * move_task_to_local_dsq() checks that holding_cpu == this_cpu.
+	 * If dequeue raced us and cleared holding_cpu, we lose and return false.
+	 * This is safe and correct - we'll retry and pick another task.
+	 *
+	 * Note: Even if task_rq changed after we released dsq->lock,
+	 * holding_cpu ensures we're the legitimate owner.
+	 */
 	moved = move_task_to_local_dsq(rq, p, 0);
 
 	double_unlock_balance(rq, task_rq);
 #endif /* CONFIG_SMP */
+
 	if (likely(moved)) {
 		slim_stats_record(TOTAL_DSP_CNT, 0, 0, 0);
 		return true;
 	}
+
+	/*
+	 * We lost the race to dequeue or task migration.
+	 * Retry from the beginning to pick another task.
+	 */
 	may_fit = NULL;
+	skip = 0;
 	goto retry;
 }
 
@@ -3015,28 +3176,50 @@ static bool check_rq_for_timeouts(struct rq *rq)
 	struct hmbird_entity *entity;
 	struct task_struct *p;
 	struct rq_flags rf;
+	struct hmbird_entity *hmbird_ts;
+	char comm[TASK_COMM_LEN] = "?";
+	pid_t pid = 0;
+	u64 dsq_id = 0;
+	unsigned long last_runnable;
+	u32 dur_ms;
 
 	rq_lock_irqsave(rq, &rf);
 	list_for_each_entry(entity, &get_hmbird_rq(rq)->watchdog_list, watchdog_node) {
-		unsigned long last_runnable;
-
 		p = entity->task;
-		last_runnable = get_hmbird_ts(p)->runnable_at;
+
+		/* Use get_task_struct to prevent task from being freed */
+		if (!get_task_struct(p))
+			continue;
+
+		hmbird_ts = get_hmbird_ts(p);
+		if (!hmbird_ts) {
+			put_task_struct(p);
+			continue;
+		}
+
+		last_runnable = hmbird_ts->runnable_at;
 
 		if (unlikely(time_after(jiffies,
 				last_runnable + hmbird_watchdog_timeout)) || watchdog_enable) {
-			u32 dur_ms = jiffies_to_msecs(jiffies - last_runnable);
+			dur_ms = jiffies_to_msecs(jiffies - last_runnable);
 
+			/* Copy needed information before unlocking */
+			strncpy(comm, p->comm, TASK_COMM_LEN - 1);
+			comm[TASK_COMM_LEN - 1] = '\0';
+			pid = p->pid;
+			dsq_id = hmbird_ts->dsq ? hmbird_ts->dsq->id : 0;
+
+			put_task_struct(p);
 			rq_unlock_irqrestore(rq, &rf);
+
 			WRITE_ONCE(sw_type, HMBIRD_SWITCH_ERR_WDT);
 			HMBIRD_FATAL_INFO_FN(HMBIRD_EXIT_ERROR_STALL,
-					"%-12s[%d] failed to run for %u.%03us, dsq=%llu, mask=%*pb",
-					p->comm, p->pid,
-					dur_ms / 1000, dur_ms % 1000,
-					get_hmbird_ts(p)->dsq ? get_hmbird_ts(p)->dsq->id : 0,
-					cpumask_pr_args(&p->cpus_mask));
+					"%-12s[%d] failed to run for %u.%03us, dsq=%llu",
+					comm, pid,
+					dur_ms / 1000, dur_ms % 1000, dsq_id);
 			return 1;
 		}
+		put_task_struct(p);
 	}
 	rq_unlock_irqrestore(rq, &rf);
 	return 0;
@@ -3140,43 +3323,65 @@ static void task_tick_hmbird(struct rq *rq, struct task_struct *curr, int queued
 
 static int hmbird_ops_prepare_task(struct task_struct *p, struct task_group *tg)
 {
-	hmbird_cond_deferred_err(TASK_OPS_PREPPED, test_bit(ffs(HMBIRD_TASK_OPS_PREPPED),
-				(unsigned long *)&get_hmbird_ts(p)->flags), "task = %s\n", p->comm);
+	struct hmbird_entity *entity = get_hmbird_ts(p);
 
-	get_hmbird_ts(p)->disallow = false;
+	/* These functions are only called for hmbird tasks */
+	if (WARN_ON_ONCE(!entity))
+		return -EINVAL;
+
+	hmbird_cond_deferred_err(TASK_OPS_PREPPED, test_bit(ffs(HMBIRD_TASK_OPS_PREPPED),
+				(unsigned long *)&entity->flags), "task = %s\n", p->comm);
+
+	entity->disallow = false;
 
 	hmbird_sched_init_task(p);
 
-	set_bit(ffs(HMBIRD_TASK_OPS_PREPPED), (unsigned long *)&get_hmbird_ts(p)->flags);
-	set_bit(ffs(HMBIRD_TASK_WATCHDOG_RESET), (unsigned long *)&get_hmbird_ts(p)->flags);
+	set_bit(ffs(HMBIRD_TASK_OPS_PREPPED), (unsigned long *)&entity->flags);
+	set_bit(ffs(HMBIRD_TASK_WATCHDOG_RESET), (unsigned long *)&entity->flags);
 	return 0;
 }
 
 static void hmbird_ops_enable_task(struct task_struct *p)
 {
-	lockdep_assert_rq_held(task_rq(p));
-	hmbird_cond_deferred_err(TASK_OPS_UNPREPPED, !test_bit(ffs(HMBIRD_TASK_OPS_PREPPED),
-				(unsigned long *)&get_hmbird_ts(p)->flags), "task = %s\n", p->comm);
+	struct hmbird_entity *entity = get_hmbird_ts(p);
 
-	clear_bit(ffs(HMBIRD_TASK_OPS_PREPPED), (unsigned long *)&get_hmbird_ts(p)->flags);
-	set_bit(ffs(HMBIRD_TASK_OPS_ENABLED), (unsigned long *)&get_hmbird_ts(p)->flags);
+	lockdep_assert_rq_held(task_rq(p));
+
+	if (WARN_ON_ONCE(!entity))
+		return;
+
+	hmbird_cond_deferred_err(TASK_OPS_UNPREPPED, !test_bit(ffs(HMBIRD_TASK_OPS_PREPPED),
+				(unsigned long *)&entity->flags), "task = %s\n", p->comm);
+
+	clear_bit(ffs(HMBIRD_TASK_OPS_PREPPED), (unsigned long *)&entity->flags);
+	set_bit(ffs(HMBIRD_TASK_OPS_ENABLED), (unsigned long *)&entity->flags);
 }
 
 static void hmbird_ops_disable_task(struct task_struct *p)
 {
+	struct hmbird_entity *entity = get_hmbird_ts(p);
+
 	lockdep_assert_rq_held(task_rq(p));
 
-	if (test_bit(ffs(HMBIRD_TASK_OPS_PREPPED), (unsigned long *)&get_hmbird_ts(p)->flags))
-		clear_bit(ffs(HMBIRD_TASK_OPS_PREPPED), (unsigned long *)&get_hmbird_ts(p)->flags);
-	else if (test_bit(ffs(HMBIRD_TASK_OPS_ENABLED), (unsigned long *)&get_hmbird_ts(p)->flags))
-		clear_bit(ffs(HMBIRD_TASK_OPS_ENABLED), (unsigned long *)&get_hmbird_ts(p)->flags);
+	if (WARN_ON_ONCE(!entity))
+		return;
+
+	if (test_bit(ffs(HMBIRD_TASK_OPS_PREPPED), (unsigned long *)&entity->flags))
+		clear_bit(ffs(HMBIRD_TASK_OPS_PREPPED), (unsigned long *)&entity->flags);
+	else if (test_bit(ffs(HMBIRD_TASK_OPS_ENABLED), (unsigned long *)&entity->flags))
+		clear_bit(ffs(HMBIRD_TASK_OPS_ENABLED), (unsigned long *)&entity->flags);
 }
 
 static void set_task_hmbird_weight(struct task_struct *p)
 {
-	u32 weight = sched_prio_to_weight[p->static_prio - MAX_RT_PRIO];
+	struct hmbird_entity *entity = get_hmbird_ts(p);
+	u32 weight;
 
-	get_hmbird_ts(p)->weight = hmbird_sched_weight_to_cgroup(weight);
+	if (WARN_ON_ONCE(!entity))
+		return;
+
+	weight = sched_prio_to_weight[p->static_prio - MAX_RT_PRIO];
+	entity->weight = hmbird_sched_weight_to_cgroup(weight);
 }
 
 /**
@@ -3197,32 +3402,42 @@ static void refresh_hmbird_weight(struct task_struct *p)
 
 int hmbird_pre_fork(struct task_struct *p)
 {
-	int ret = 0;
+	struct hmbird_entity *entity;
 
-	p->android_oem_data1[HMBIRD_TS_IDX] =
-		(u64)(kzalloc(sizeof(struct hmbird_entity), GFP_KERNEL));
-	if (!get_hmbird_ts(p))
-		return -1;
+	if (!p)
+		return -EINVAL;
 
-	get_hmbird_ts(p)->dsq              = NULL;
-	INIT_LIST_HEAD(&get_hmbird_ts(p)->dsq_node.fifo);
-	RB_CLEAR_NODE(&get_hmbird_ts(p)->dsq_node.priq);
-	INIT_LIST_HEAD(&get_hmbird_ts(p)->watchdog_node);
-	get_hmbird_ts(p)->flags            = 0;
-	get_hmbird_ts(p)->weight           = 0;
-	get_hmbird_ts(p)->sticky_cpu       = -1;
-	get_hmbird_ts(p)->holding_cpu      = -1;
-	get_hmbird_ts(p)->kf_mask          = 0;
-	atomic64_set(&get_hmbird_ts(p)->ops_state, 0);
-	get_hmbird_ts(p)->runnable_at      = INITIAL_JIFFIES;
-	get_hmbird_ts(p)->slice            = HMBIRD_SLICE_DFL;
-	get_hmbird_ts(p)->task             = p;
+	/* Check if already allocated */
+	if (p->android_oem_data1[HMBIRD_TS_IDX] != 0)
+		return -EEXIST;
+
+	/* Allocate hmbird_entity */
+	entity = kzalloc(sizeof(struct hmbird_entity), GFP_KERNEL);
+	if (!entity)
+		return -ENOMEM;
+
+	p->android_oem_data1[HMBIRD_TS_IDX] = (u64)entity;
+
+	/* Initialize all fields */
+	entity->dsq              = NULL;
+	INIT_LIST_HEAD(&entity->dsq_node.fifo);
+	RB_CLEAR_NODE(&entity->dsq_node.priq);
+	INIT_LIST_HEAD(&entity->watchdog_node);
+	entity->flags            = 0;
+	entity->weight           = 0;
+	entity->sticky_cpu       = -1;
+	entity->holding_cpu      = -1;
+	entity->kf_mask          = 0;
+	atomic64_set(&entity->ops_state, 0);
+	entity->runnable_at      = INITIAL_JIFFIES;
+	entity->slice            = HMBIRD_SLICE_DFL;
+	entity->task             = p;
 	hmbird_set_sched_prop(p, 0);
 
-	get_hmbird_ts(p)->critical_affinity_cpu = -1;
-	get_hmbird_ts(p)->sched_class      = &hmbird_sched_class;
-	get_hmbird_ts(p)->tick_hit_count   = 0;
-	get_hmbird_ts(p)->start_jiffies    = 0;
+	entity->critical_affinity_cpu = -1;
+	entity->sched_class      = &hmbird_sched_class;
+	entity->tick_hit_count   = 0;
+	entity->start_jiffies    = 0;
 
 	/*
 	 * BPF scheduler enable/disable paths want to be able to iterate and
@@ -3231,7 +3446,7 @@ int hmbird_pre_fork(struct task_struct *p)
 	 * exclude forks.
 	 */
 
-	return ret;
+	return 0;
 }
 
 void hmbird_post_fork(struct task_struct *p)
@@ -3280,17 +3495,29 @@ void hmbird_cancel_fork(struct task_struct *p)
 void hmbird_free(struct task_struct *p)
 {
 	unsigned long flags;
+	struct hmbird_entity *hmbird;
+	bool need_disable;
+
+	if (!p)
+		return;
+
+	/* Get hmbird_entity pointer once */
+	hmbird = get_hmbird_ts(p);
+	if (!hmbird)
+		return;
 
 	spin_lock_irqsave(&hmbird_tasks_lock, flags);
-	list_del_init(&get_hmbird_ts(p)->tasks_node);
+	list_del_init(&hmbird->tasks_node);
 	spin_unlock_irqrestore(&hmbird_tasks_lock, flags);
 
 	/*
 	 * @p is off hmbird_tasks and wholly ours. hmbird_ops_enable()'s PREPPED ->
 	 * ENABLED transitions can't race us. Disable ops for @p.
 	 */
-	if (test_bit(ffs(HMBIRD_TASK_OPS_PREPPED), (unsigned long *)&get_hmbird_ts(p)->flags) ||
-		test_bit(ffs(HMBIRD_TASK_OPS_ENABLED), (unsigned long *)&get_hmbird_ts(p)->flags)) {
+	need_disable = test_bit(ffs(HMBIRD_TASK_OPS_PREPPED), (unsigned long *)&hmbird->flags) ||
+		      test_bit(ffs(HMBIRD_TASK_OPS_ENABLED), (unsigned long *)&hmbird->flags);
+
+	if (need_disable) {
 		struct rq_flags rf;
 		struct rq *rq;
 
@@ -3331,8 +3558,17 @@ static inline bool hmbird_prio_higher(struct task_struct *a, struct task_struct 
 {
 	int type_a = hmbird_get_task_type(a);
 	int type_b = hmbird_get_task_type(b);
+	int prio_a, prio_b;
 
-	return sched_prop_to_preempt_prio[type_a] > sched_prop_to_preempt_prio[type_b];
+	/* Boundary check to prevent array out-of-bounds access */
+	if (type_a < 0 || type_a >= HMBIRD_TASK_PROP_MAX ||
+	    type_b < 0 || type_b >= HMBIRD_TASK_PROP_MAX)
+		return false;
+
+	prio_a = sched_prop_to_preempt_prio[type_a];
+	prio_b = sched_prop_to_preempt_prio[type_b];
+
+	return prio_a > prio_b;
 }
 
 static void check_preempt_curr_hmbird(struct rq *rq, struct task_struct *p, int wake_flags)
@@ -3784,19 +4020,22 @@ static struct kthread_worker *hmbird_create_rt_helper(const char *name)
 static inline void set_audio_thread_sched_prop(struct task_struct *p)
 {
 	struct cgroup_subsys_state *css;
+	const char *cgroup_name;
+	bool is_audio_app = false;
 
 	if (likely(p->prio >= MAX_RT_PRIO))
 		return;
 
 	rcu_read_lock();
 	css = task_css(p, cpuset_cgrp_id);
-	if (!css) {
-		rcu_read_unlock();
-		return;
+	if (css && css->cgroup && css->cgroup->kn) {
+		/* Copy the name while holding RCU lock to prevent use-after-free */
+		cgroup_name = css->cgroup->kn->name;
+		is_audio_app = !strcmp(cgroup_name, "audio-app");
 	}
 	rcu_read_unlock();
 
-	if (!strcmp(css->cgroup->kn->name, "audio-app"))
+	if (is_audio_app)
 		hmbird_set_sched_prop(p, SCHED_PROP_DEADLINE_LEVEL1);
 }
 
