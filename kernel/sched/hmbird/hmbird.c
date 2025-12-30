@@ -639,14 +639,23 @@ static void init_isolate_cpus(void)
 	WARN_ON(!alloc_cpumask_var(&iso_masks.exclusive, GFP_KERNEL));
 	WARN_ON(!alloc_cpumask_var(&iso_masks.big, GFP_KERNEL));
 	WARN_ON(!alloc_cpumask_var(&iso_masks.little, GFP_KERNEL));
-	cpumask_set_cpu(0, iso_masks.big);
-	cpumask_set_cpu(1, iso_masks.big);
-	cpumask_set_cpu(2, iso_masks.big);
-	cpumask_set_cpu(3, iso_masks.big);
-	cpumask_set_cpu(4, iso_masks.big);
-	cpumask_set_cpu(5, iso_masks.ex_free);
-	cpumask_set_cpu(6, iso_masks.partial);
-	cpumask_set_cpu(7, iso_masks.ex_free);
+
+	/* OnePlus 13 - Snapdragon 8 Elite (SM8750) CPU Configuration
+	 * CPU 0-5: 384-3532MHz (Performance cores)
+	 * CPU 6-7: 1017-4320MHz (Prime super cores - Oryon)
+	 */
+
+	/* Performance cores @ 3532MHz */
+	cpumask_set_cpu(0, iso_masks.little);
+	cpumask_set_cpu(1, iso_masks.little);
+	cpumask_set_cpu(2, iso_masks.little);
+	cpumask_set_cpu(3, iso_masks.little);
+	cpumask_set_cpu(4, iso_masks.little);
+	cpumask_set_cpu(5, iso_masks.little);
+
+	/* Prime super cores @ 4320MHz */
+	cpumask_set_cpu(6, iso_masks.big);
+	cpumask_set_cpu(7, iso_masks.big);
 }
 
 extern spinlock_t css_set_lock;
